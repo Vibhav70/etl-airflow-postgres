@@ -1,12 +1,12 @@
-# ETL Pipeline with Apache Airflow
+# ETL Pipeline with Apache Airflow for NASA APOD
 
 ## Overview
-This project demonstrates an ETL (Extract, Transform, Load) pipeline implemented using **Apache Airflow**. The pipeline fetches data from NASA's API, processes and transforms the data, and loads it into a **PostgreSQL database** using Airflow's **PostgresHook**.
+This project demonstrates an ETL (Extract, Transform, Load) pipeline implemented using **Apache Airflow**. The pipeline fetches data from NASA's Astronomy Picture of the Day (APOD) API, processes and transforms the data, and loads it into a **PostgreSQL database** using Airflow's **PostgresHook**.
 
 ---
 
 ## Features
-- **Data Extraction:** Fetch data from NASA API.
+- **Data Extraction:** Fetch data from NASA APOD API.
 - **Data Transformation:** Process and clean the extracted data.
 - **Data Loading:** Store the transformed data into a PostgreSQL database.
 - **Automation:** Schedule and manage workflows using Apache Airflow.
@@ -25,9 +25,7 @@ This project demonstrates an ETL (Extract, Transform, Load) pipeline implemented
 ```
 project-directory/
 ├── dags/
-│   ├── nasa_etl_pipeline.py
-├── plugins/
-│   ├── custom_operator.py
+│   ├── nasa_apod_postgres.py
 ├── sql/
 │   ├── create_table.sql
 ├── requirements.txt
@@ -81,38 +79,45 @@ airflow webserver --port 8080
 airflow scheduler
 ```
 
-### 5. Add Connection in Airflow
-- Go to **Admin > Connections** in the Airflow UI.
-- Add a new connection with the following details:
-  - **Conn Id:** postgres_default
-  - **Conn Type:** Postgres
-  - **Host:** localhost
-  - **Schema:** nasa_data
-  - **Login:** postgres
-  - **Password:** password
-  - **Port:** 5432
+### 5. Add Connections in Airflow
+- **PostgreSQL Connection:**
+  - Conn Id: `my_postgres_connection`
+  - Conn Type: Postgres
+  - Host: localhost
+  - Schema: nasa_data
+  - Login: postgres
+  - Password: password
+  - Port: 5432
+
+- **NASA API Connection:**
+  - Conn Id: `nasa_api`
+  - Conn Type: HTTP
+  - Host: `https://api.nasa.gov`
+  - Extra: `{"api_key": "your_api_key_here"}`
 
 ### 6. Trigger the DAG
-1. Place the DAG file (`nasa_etl_pipeline.py`) in the `dags/` folder.
+1. Place the DAG file (`nasa_apod_postgres.py`) in the `dags/` folder.
 2. Enable the DAG in the Airflow UI and trigger it.
 
 ---
 
 ## Pipeline Steps
-1. **Extract Data:** Fetch data from NASA API endpoint.
-2. **Transform Data:** Parse JSON response, clean data, and structure it.
-3. **Load Data:** Insert data into PostgreSQL database using Airflow's PostgresHook.
+1. **Create Table:** Ensures the database table exists before processing data.
+2. **Extract Data:** Fetch data from NASA APOD API endpoint.
+3. **Transform Data:** Process and structure the data to match the database schema.
+4. **Load Data:** Insert data into PostgreSQL database using Airflow's PostgresHook.
 
 ---
 
 ## Sample SQL Schema
 ```sql
-CREATE TABLE nasa_asteroids (
+CREATE TABLE apod_data (
     id SERIAL PRIMARY KEY,
-    name VARCHAR(255),
-    magnitude FLOAT,
-    is_hazardous BOOLEAN,
-    date DATE
+    title VARCHAR(255),
+    explanation TEXT,
+    url TEXT,
+    date DATE,
+    media_type VARCHAR(50)
 );
 ```
 
@@ -121,91 +126,81 @@ CREATE TABLE nasa_asteroids (
 ## DAG Code Example
 ```python
 from airflow import DAG
-from airflow.operators.python_operator import PythonOperator
+from airflow.providers.http.operators.http import SimpleHttpOperator
+from airflow.decorators import task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-import requests
+from airflow.utils.dates import days_ago
 import json
-from datetime import datetime
 
-# Define default args
-default_args = {
-    'owner': 'airflow',
-    'depends_on_past': False,
-    'start_date': datetime(2023, 1, 1),
-    'retries': 1
-}
-
-# Define DAG
-dag = DAG(
-    'nasa_etl_pipeline',
-    default_args=default_args,
-    description='ETL pipeline for NASA data',
+with DAG(
+    dag_id='nasa_apod_postgres',
+    start_date=days_ago(1),
     schedule_interval='@daily',
-)
+    catchup=False
+) as dag:
 
-# ETL functions
-def extract():
-    url = 'https://api.nasa.gov/neo/rest/v1/feed?start_date=2023-01-01&api_key=DEMO_KEY'
-    response = requests.get(url)
-    data = response.json()
-    with open('/tmp/nasa_data.json', 'w') as f:
-        json.dump(data, f)
+    @task
+    def create_table():
+        postgres_hook = PostgresHook(postgres_conn_id='my_postgres_connection')
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS apod_data (
+            id SERIAL PRIMARY KEY,
+            title VARCHAR(255),
+            explanation TEXT,
+            url TEXT,
+            date DATE,
+            media_type VARCHAR(50)
+        );
+        """
+        postgres_hook.run(create_table_query)
 
-def transform():
-    with open('/tmp/nasa_data.json') as f:
-        data = json.load(f)
-    transformed_data = []
-    for asteroid in data['near_earth_objects']['2023-01-01']:
-        transformed_data.append((
-            asteroid['id'],
-            asteroid['name'],
-            asteroid['absolute_magnitude_h'],
-            asteroid['is_potentially_hazardous_asteroid'],
-            '2023-01-01'
+    extract_apod = SimpleHttpOperator(
+        task_id='extract_apod',
+        http_conn_id='nasa_api',
+        endpoint='planetary/apod',
+        method='GET',
+        data={"api_key": "{{conn.nasa_api.extra_dejson.api_key}}"},
+        response_filter=lambda response: response.json(),
+    )
+
+    @task
+    def transform_apod_data(response):
+        apod_data = {
+            'title': response.get('title', ''),
+            'explanation': response.get('explanation', ''),
+            'date': response.get('date', ''),
+            'media_type': response.get('media_type', '')
+        }
+        return apod_data
+
+    @task
+    def load_data_to_postgres(apod_data):
+        postgres_hook = PostgresHook(postgres_conn_id='my_postgres_connection')
+        insert_query = """
+        INSERT INTO apod_data (title, explanation, url, date, media_type)
+        VALUES (%s, %s, %s, %s, %s);
+        """
+        postgres_hook.run(insert_query, parameters=(
+            apod_data['title'],
+            apod_data['explanation'],
+            apod_data['url'],
+            apod_data['date'],
+            apod_data['media_type']
         ))
-    with open('/tmp/transformed_data.json', 'w') as f:
-        json.dump(transformed_data, f)
 
-def load():
-    hook = PostgresHook(postgres_conn_id='postgres_default')
-    with open('/tmp/transformed_data.json') as f:
-        data = json.load(f)
-    for record in data:
-        hook.run("""
-            INSERT INTO nasa_asteroids (id, name, magnitude, is_hazardous, date)
-            VALUES (%s, %s, %s, %s, %s)
-        """, parameters=record)
-
-# Define tasks
-extract_task = PythonOperator(
-    task_id='extract_task',
-    python_callable=extract,
-    dag=dag,
-)
-
-transform_task = PythonOperator(
-    task_id='transform_task',
-    python_callable=transform,
-    dag=dag,
-)
-
-load_task = PythonOperator(
-    task_id='load_task',
-    python_callable=load,
-    dag=dag,
-)
-
-# Task pipeline
-extract_task >> transform_task >> load_task
+    create_table() >> extract_apod
+    api_response = extract_apod.output
+    transformed_data = transform_apod_data(api_response)
+    load_data_to_postgres(transformed_data)
 ```
 
 ---
 
 ## Future Improvements
-- Enhance error handling and logging.
-- Optimize transformations for scalability.
-- Integrate with cloud storage solutions (e.g., AWS S3 or GCS).
-- Implement data validation and testing.
+- Add error handling and retries for API failures.
+- Implement data validation checks before loading.
+- Optimize queries for scalability.
+- Integrate cloud storage for data backups.
 
 ---
 
